@@ -1,2 +1,25 @@
 #!/usr/bin/env sh
-npm run typecheck && npm test --if-present && npm run build --if-present
+set -e
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+
+# If you set PUSH_ALL=1, always run the full pipeline
+if [ "$PUSH_ALL" = "1" ]; then
+  npm run typecheck
+  npm test --if-present
+  npm run build --if-present
+  exit 0
+fi
+
+case "$BRANCH" in
+  main|master|release/*|hotfix/*)
+    # Full gate on important branches
+    npm run typecheck
+    npm test --if-present
+    npm run build --if-present
+    ;;
+  *)
+    # Fast gate on feature branches
+    npm run typecheck
+    ;;
+esac
