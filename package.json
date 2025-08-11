@@ -6,8 +6,11 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
+    "prepare": "husky",
     "lint": "next lint",
-    "prepare": "husky"
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit"
   },
   "lint-staged": {
     "**/*.{ts,tsx,js,jsx,mjs,cjs}": [
