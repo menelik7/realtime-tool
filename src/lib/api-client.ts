@@ -8,11 +8,14 @@
 // - Smart base URL:
 //     * On the server (RSC/Server Actions): uses process.env.API_BASE_URL (server-only, NOT exposed)
 //     * In the browser: uses process.env.NEXT_PUBLIC_API_BASE_URL
-//   If neither is set, it falls back to same-origin (your Next.js app’s domain).
+//   If neither is set, it falls back to same-origin (your Next.js app's domain).
 // - Optional bearer auth via `setAuth()` for client-side, or via per-request headers for server-side.
 // - Timeouts + retry with exponential backoff.
 // - Typed responses/bodies using generics.
 // - Next.js `fetch` extensions supported (revalidate/tags) when called server-side.
+// - Enhanced response type handling (JSON, text, blob, etc.)
+// - Environment variable validation with helpful warnings
+// - Optional debug logging in development
 //
 // NOTE: You do NOT need to import HeadersInit / AbortSignal / RequestInit —
 //       these are built-in DOM fetch types provided by TypeScript in Next.js.
@@ -116,6 +119,7 @@ function isServer() {
  * - In the browser: prefer `NEXT_PUBLIC_API_BASE_URL`
  * - If neither is set: return empty string to mean "same-origin"
  * - Always strip trailing slashes to avoid double slashes when joining
+ * - Validates URL format and warns about malformed URLs
  */
 function resolveBaseUrl() {
   // Prefer server-only base URL on the server
@@ -124,7 +128,17 @@ function resolveBaseUrl() {
   const clientBase = process.env.NEXT_PUBLIC_API_BASE_URL?.trim();
 
   const chosen = (isServer() ? serverBase : clientBase) || '';
-  return chosen.replace(/\/+$/, '');
+  const cleaned = chosen.replace(/\/+$/, '');
+
+  // Validate URL format if a base URL is provided
+  if (cleaned && !/^https?:\/\//.test(cleaned)) {
+    const envVar = isServer() ? 'API_BASE_URL' : 'NEXT_PUBLIC_API_BASE_URL';
+    console.warn(
+      `[ApiClient] Invalid base URL format in ${envVar}: "${cleaned}". Expected format: https://api.example.com`,
+    );
+  }
+
+  return cleaned;
 }
 
 /** Utility: detect if a value is a "body we should not JSON.stringify". */
@@ -150,10 +164,13 @@ class ApiClient {
   private defaultHeaders: HeadersInit = { 'Content-Type': 'application/json' };
   /** Optional bearer token for client-side usage. Avoid mutating this on the server. */
   private authToken: string | null = null;
+  /** Enable debug logging in development */
+  private readonly debug = process.env.NODE_ENV === 'development';
 
   /** Private constructor ensures Singleton pattern. */
   private constructor(baseUrl: string) {
     this.baseUrl = baseUrl;
+    this.log('Initialized with base URL:', baseUrl || 'same-origin');
   }
 
   /** Global instance accessor. */
@@ -170,6 +187,14 @@ class ApiClient {
    */
   setAuth(token: string | null) {
     this.authToken = token;
+    this.log('Auth token updated:', token ? '[REDACTED]' : 'cleared');
+  }
+
+  /** Debug logging helper */
+  private log(message: string, data?: unknown) {
+    if (this.debug) {
+      console.log(`[ApiClient] ${message}`, data);
+    }
   }
 
   /**
@@ -177,7 +202,7 @@ class ApiClient {
    * - If baseUrl is '', we use same-origin:
    *     - On the client: window.location.origin
    *     - On the server: we still need an absolute base to construct a URL object,
-   *       so we use 'http://localhost' (it’s not actually used to send network calls when Next routes same-origin).
+   *       so we use 'http://localhost' (it's not actually used to send network calls when Next routes same-origin).
    */
   private buildUrl(path: string, query?: Query) {
     const cleanedPath = path.startsWith('/') ? path : `/${path}`;
@@ -220,7 +245,40 @@ class ApiClient {
     url: string,
     init: RequestInit & { next?: { revalidate?: number | false; tags?: string[] } },
   ) {
+    this.log(`${init.method || 'GET'} ${url}`);
     return fetch(url, init);
+  }
+
+  /**
+   * Enhanced response parsing that handles various content types.
+   * Supports JSON, text, binary data (blobs), and other common response formats.
+   */
+  private async parseResponse<T>(res: Response): Promise<T> {
+    const contentType = res.headers.get('content-type') || '';
+
+    // JSON responses (most common)
+    if (contentType.includes('application/json')) {
+      return (await res.json()) as T;
+    }
+
+    // Binary data (images, files, etc.)
+    if (
+      contentType.includes('application/octet-stream') ||
+      contentType.includes('image/') ||
+      contentType.includes('video/') ||
+      contentType.includes('audio/') ||
+      contentType.includes('application/pdf')
+    ) {
+      return (await res.blob()) as unknown as T;
+    }
+
+    // Form data
+    if (contentType.includes('multipart/form-data')) {
+      return (await res.formData()) as unknown as T;
+    }
+
+    // Default to text for everything else
+    return (await res.text()) as unknown as T;
   }
 
   /**
@@ -230,6 +288,7 @@ class ApiClient {
    * - Handles JSON bodies and multipart bodies intelligently.
    * - Retries transient errors if configured.
    * - Throws ApiError on non-2xx with parsed payload when possible.
+   * - Enhanced response parsing for various content types.
    */
   private async request<TResponse, TBody = unknown>({
     path,
@@ -310,19 +369,22 @@ class ApiClient {
           // Retry on configured statuses
           if (attempt < attempts && retryOn.has(res.status)) {
             const delay = backoffMs * Math.pow(2, attempt - 1);
+            this.log(
+              `Retrying in ${delay}ms (attempt ${attempt}/${attempts}) due to status ${res.status}`,
+            );
             await new Promise((r) => setTimeout(r, delay));
             continue;
           }
 
-          throw new ApiError(message || `HTTP ${res.status}`, res.status, data);
+          const error = new ApiError(message || `HTTP ${res.status}`, res.status, data);
+          this.log('Request failed:', { status: res.status, message: error.message });
+          throw error;
         }
 
-        // Successful response: parse JSON when available, else text
-        const ct = res.headers.get('content-type') || '';
-        if (ct.includes('application/json')) {
-          return (await res.json()) as TResponse;
-        }
-        return (await res.text()) as unknown as TResponse;
+        // Successful response: use enhanced parsing
+        const result = await this.parseResponse<TResponse>(res);
+        this.log('Request succeeded');
+        return result;
       } catch (err: unknown) {
         // Save the last error so we can throw it after all retries fail
         lastError = err;
@@ -332,11 +394,16 @@ class ApiClient {
         // - Do NOT retry AbortError (intentional cancellation)
         if (attempt < attempts && !isApiErrorLike(err) && !isAbortError(err)) {
           const delay = backoffMs * Math.pow(2, attempt - 1);
+          this.log(
+            `Retrying in ${delay}ms (attempt ${attempt}/${attempts}) due to network error:`,
+            err,
+          );
           await new Promise((r) => setTimeout(r, delay));
           continue; // next attempt
         }
 
         // No more retries OR non-retryable error → throw immediately
+        this.log('Request failed (no retry):', err);
         throw err;
       }
     }
@@ -394,7 +461,7 @@ export const api = ApiClient.instance;
 // -------------------------------------------------------------------------------------
 // USAGE NOTES (quick reference)
 //
-// 1) Environment variables (since you’re building a separate Node backend):
+// 1) Environment variables (since you're building a separate Node backend):
 //    - Server-only (NOT exposed to browser):  API_BASE_URL="https://api.your-backend.com"
 //    - Browser (public):                      NEXT_PUBLIC_API_BASE_URL="https://api.your-backend.com"
 //    If either is missing, we fall back to same-origin.
@@ -424,20 +491,20 @@ export const api = ApiClient.instance;
 //      const [rooms, setRooms] = useState<Room[]|null>(null);
 //      const [error, setError] = useState<string|null>(null);
 //
-//    useEffect(() => {
-//      const ac = new AbortController();
-
-//     async function fetchRooms() {
-//       try {
-//         const rooms = await api.get<Room[]>('/rooms', { limit: 20 }, { signal: ac.signal });
-//          setData(rooms);
-//        } catch (e) {
-//          setError(e instanceof Error ? e.message : 'Unknown error');
+//      useEffect(() => {
+//        const ac = new AbortController();
+//
+//        async function fetchRooms() {
+//          try {
+//            const rooms = await api.get<Room[]>('/rooms', { limit: 20 }, { signal: ac.signal });
+//            setData(rooms);
+//          } catch (e) {
+//            setError(e instanceof Error ? e.message : 'Unknown error');
+//          }
 //        }
-//      }
-
-//       fetchRooms();
-
+//
+//        fetchRooms();
+//
 //        return () => ac.abort(); // cleanup cancels the request
 //      }, []);
 //
@@ -449,9 +516,13 @@ export const api = ApiClient.instance;
 // 4) Uploading FormData:
 //    const fd = new FormData();
 //    fd.append('file', file);
-//    await api.post('/upload', fd, { headers: {} }); // don’t set Content-Type
+//    await api.post('/upload', fd, { headers: {} }); // don't set Content-Type
 //
-// 5) Handling ApiError:
+// 5) Downloading binary data:
+//    const blob = await api.get<Blob>('/download/image.jpg');
+//    const url = URL.createObjectURL(blob);
+//
+// 6) Handling ApiError:
 //    try {
 //      await api.get('/secret');
 //    } catch (e) {
@@ -460,6 +531,6 @@ export const api = ApiClient.instance;
 //      }
 //    }
 //
-// 6) Setting a bearer token on the client after login:
+// 7) Setting a bearer token on the client after login:
 //    api.setAuth(accessToken); // use per-request headers instead on the server.
 // -------------------------------------------------------------------------------------
